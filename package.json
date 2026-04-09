@@ -1,0 +1,119 @@
+{
+  "name": "bin-view",
+  "displayName": "BinView",
+  "description": "Inspect raw binary, NumPy, and PyTorch tensor files inside VS Code.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Data Science"
+  ],
+  "activationEvents": [
+    "onCommand:binView.openBinary",
+    "onCommand:binView.compareBinary",
+    "onCommand:binView.gotoLine",
+    "onCommand:binView.reshape",
+    "onCommand:binView.slice",
+    "onCommand:binView.resetTransform",
+    "onCommand:binView.reload"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "binView.openBinary",
+        "title": "BinView: Open Binary File"
+      },
+      {
+        "command": "binView.compareBinary",
+        "title": "BinView: Compare Output With Golden"
+      },
+      {
+        "command": "binView.gotoLine",
+        "title": "BinView: Go To Line"
+      },
+      {
+        "command": "binView.reshape",
+        "title": "BinView: Reshape Tensor"
+      },
+      {
+        "command": "binView.slice",
+        "title": "BinView: Slice Tensor"
+      },
+      {
+        "command": "binView.resetTransform",
+        "title": "BinView: Reset Tensor Transform"
+      },
+      {
+        "command": "binView.reload",
+        "title": "BinView: Reload Viewer"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "binView.openBinary",
+          "group": "navigation",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "binView.compareBinary",
+          "group": "navigation",
+          "when": "resourceScheme == file"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "binView.gotoLine",
+          "when": "binView.viewerFocused"
+        },
+        {
+          "command": "binView.reshape",
+          "when": "binView.canTransform"
+        },
+        {
+          "command": "binView.slice",
+          "when": "binView.canTransform"
+        },
+        {
+          "command": "binView.resetTransform",
+          "when": "binView.canTransform"
+        },
+        {
+          "command": "binView.reload",
+          "when": "binView.viewerFocused"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "binView.gotoLine",
+        "key": "ctrl+g",
+        "mac": "cmd+g",
+        "when": "binView.viewerFocused"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "package": "vsce package",
+    "package:ci": "mkdir -p dist && vsce package --out dist/binview.vsix"
+  },
+  "dependencies": {
+    "@vscode/python-extension": "^1.0.6"
+  },
+  "overrides": {
+    "cheerio": "1.0.0-rc.12"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "2.20.1",
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.6.3"
+  }
+}
