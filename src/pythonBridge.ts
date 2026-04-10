@@ -1,3 +1,4 @@
+import * as path from 'node:path';
 import * as cp from 'node:child_process';
 import * as readline from 'node:readline';
 import * as vscode from 'vscode';
@@ -24,6 +25,13 @@ interface MetadataResponse {
   totalElements: number;
   transformSummary?: string;
   notes: string[];
+}
+
+export interface ConsoleResponse {
+  output: string;
+  resultText?: string;
+  updated: boolean;
+  metadata?: MetadataResponse;
 }
 
 interface OpenResponse extends MetadataResponse {
@@ -82,6 +90,14 @@ export class TorchTensorBridge {
     return this.send<MetadataResponse>('slice', { expression });
   }
 
+  applyPython(expression: string): Promise<MetadataResponse> {
+    return this.send<MetadataResponse>('python', { expression });
+  }
+
+  runConsole(code: string): Promise<ConsoleResponse> {
+    return this.send<ConsoleResponse>('console', { code });
+  }
+
   reset(): Promise<MetadataResponse> {
     return this.send<MetadataResponse>('reset', {});
   }
@@ -131,6 +147,7 @@ export class TorchTensorBridge {
       return;
     }
 
+    this.stderr = '';
     const child = cp.spawn(this.pythonPath, ['-u', this.scriptPath], {
       stdio: 'pipe',
       cwd: this.workspaceUri?.fsPath
@@ -167,9 +184,13 @@ export class TorchTensorBridge {
       }
     });
 
+    child.on('error', (error) => {
+      this.rejectAll(new Error(formatBridgeStartupError(this.pythonPath, this.stderr, error.message)));
+      this.process = undefined;
+    });
+
     child.on('exit', (code, signal) => {
-      const suffix = this.stderr.trim() ? `\n${this.stderr.trim()}` : '';
-      this.rejectAll(new Error(`Torch bridge exited unexpectedly (code=${code}, signal=${signal}).${suffix}`));
+      this.rejectAll(new Error(formatBridgeExitError(this.pythonPath, this.stderr, code, signal)));
       this.process = undefined;
     });
 
@@ -218,17 +239,83 @@ export async function resolvePythonInterpreter(resource: vscode.Uri | undefined)
 
   const configPath = vscode.workspace.getConfiguration('python', resource).get<string>('defaultInterpreterPath');
   if (configPath) {
-    return configPath;
+    return normalizeInterpreterPath(configPath, resource);
   }
 
   try {
     const commandResult = await vscode.commands.executeCommand<string>('python.interpreterPath');
     if (commandResult) {
-      return commandResult;
+      return normalizeInterpreterPath(commandResult, resource);
     }
   } catch {
     // Ignore legacy command failures.
   }
 
+  return resolveInterpreterFromPath();
+}
+
+function normalizeInterpreterPath(configPath: string, resource: vscode.Uri | undefined): string {
+  const workspaceFolder = resource
+    ? vscode.workspace.getWorkspaceFolder(resource)?.uri.fsPath
+    : vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+  if (!workspaceFolder) {
+    return configPath;
+  }
+
+  const resolved = configPath.replaceAll('${workspaceFolder}', workspaceFolder);
+  if (path.isAbsolute(resolved) || resolved === 'python' || resolved === 'python3') {
+    return resolved;
+  }
+
+  return path.resolve(workspaceFolder, resolved);
+}
+
+function resolveInterpreterFromPath(): string | undefined {
+  const candidates = process.platform === 'win32'
+    ? [
+        { command: 'py', args: ['-3', '-c', 'import sys; print(sys.executable)'] },
+        { command: 'python', args: ['-c', 'import sys; print(sys.executable)'] }
+      ]
+    : [
+        { command: 'python3', args: ['-c', 'import sys; print(sys.executable)'] },
+        { command: 'python', args: ['-c', 'import sys; print(sys.executable)'] }
+      ];
+
+  for (const candidate of candidates) {
+    const result = cp.spawnSync(candidate.command, candidate.args, {
+      encoding: 'utf8'
+    });
+    if (result.status === 0) {
+      const executable = result.stdout.trim();
+      return executable || candidate.command;
+    }
+  }
+
   return undefined;
+}
+
+function formatBridgeStartupError(pythonPath: string, stderr: string, reason: string): string {
+  const detail = stderr.trim();
+  if (detail.includes('Failed to import torch')) {
+    return `Python interpreter "${pythonPath}" could not import torch. Install torch in that environment or switch the active interpreter.\n${detail}`;
+  }
+
+  const suffix = detail ? `\n${detail}` : '';
+  return `Failed to start Python interpreter "${pythonPath}": ${reason}${suffix}`;
+}
+
+function formatBridgeExitError(
+  pythonPath: string,
+  stderr: string,
+  code: number | null,
+  signal: NodeJS.Signals | null
+): string {
+  const detail = stderr.trim();
+  if (detail.includes('Failed to import torch')) {
+    return `Python interpreter "${pythonPath}" could not import torch. Install torch in that environment or switch the active interpreter.\n${detail}`;
+  }
+
+  const suffix = detail ? `\n${detail}` : '';
+  return `Torch bridge exited unexpectedly for "${pythonPath}" (code=${code}, signal=${signal}).${suffix}`;
 }

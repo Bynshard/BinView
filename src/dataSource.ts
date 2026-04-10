@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { decodeScalar, resolveDType, type DTypeDescriptor, type DisplayScalar, type SourceFormat } from './dtypes';
 import { readNpyHeader } from './npy';
-import { TorchTensorBridge, resolvePythonInterpreter } from './pythonBridge';
+import { TorchTensorBridge, resolvePythonInterpreter, type ConsoleResponse } from './pythonBridge';
 
 export interface SourceMetadata {
   label: string;
@@ -22,6 +22,8 @@ export interface BinarySource {
   readScalars(startIndex: number, count: number): Promise<DisplayScalar[]>;
   reshape?(shape: number[]): Promise<SourceMetadata>;
   slice?(expression: string): Promise<SourceMetadata>;
+  applyPython?(expression: string): Promise<SourceMetadata>;
+  runConsole?(code: string): Promise<ConsoleResponse>;
   resetTransform?(): Promise<SourceMetadata>;
   dispose(): Promise<void>;
 }
@@ -169,6 +171,36 @@ export class TorchBinarySource implements BinarySource {
       notes: result.notes
     };
     return this.metadata;
+  }
+
+  async applyPython(expression: string): Promise<SourceMetadata> {
+    const bridge = await this.getBridge();
+    const result = await bridge.applyPython(expression);
+    this.metadata = {
+      ...(await this.getMetadata()),
+      dtypeLabel: result.dtype,
+      shape: result.shape,
+      totalElements: result.totalElements,
+      transformSummary: result.transformSummary,
+      notes: result.notes
+    };
+    return this.metadata;
+  }
+
+  async runConsole(code: string): Promise<ConsoleResponse> {
+    const bridge = await this.getBridge();
+    const result = await bridge.runConsole(code);
+    if (result.updated && result.metadata) {
+      this.metadata = {
+        ...(await this.getMetadata()),
+        dtypeLabel: result.metadata.dtype,
+        shape: result.metadata.shape,
+        totalElements: result.metadata.totalElements,
+        transformSummary: result.metadata.transformSummary,
+        notes: result.metadata.notes
+      };
+    }
+    return result;
   }
 
   async resetTransform(): Promise<SourceMetadata> {

@@ -16,6 +16,7 @@ interface ViewerLine {
 interface ViewerState {
   rowsPerLine: number;
   totalLines: number;
+  maxElements: number;
   left: SourceMetadata;
   right?: SourceMetadata;
   canTransform: boolean;
@@ -32,12 +33,16 @@ export class ViewerSession implements vscode.Disposable {
     private readonly context: vscode.ExtensionContext,
     private readonly leftSource: BinarySource,
     private readonly rightSource: BinarySource | undefined,
-    private readonly onFocus: (session: ViewerSession | undefined, source: ViewerSession) => void
+    private readonly onFocus: (session: ViewerSession | undefined, source: ViewerSession) => void,
+    panel?: vscode.WebviewPanel
   ) {
-    this.panel = vscode.window.createWebviewPanel('binView.viewer', 'BinView', vscode.ViewColumn.Active, {
+    this.panel = panel ?? vscode.window.createWebviewPanel('binView.viewer', 'BinView', vscode.ViewColumn.Active, {
       enableScripts: true,
       retainContextWhenHidden: true
     });
+    this.panel.webview.options = {
+      enableScripts: true
+    };
 
     this.panel.onDidDispose(() => {
       void this.dispose();
@@ -69,6 +74,18 @@ export class ViewerSession implements vscode.Disposable {
     return session;
   }
 
+  static async createInPanel(
+    context: vscode.ExtensionContext,
+    leftSource: BinarySource,
+    rightSource: BinarySource | undefined,
+    panel: vscode.WebviewPanel,
+    onFocus: (session: ViewerSession | undefined, source: ViewerSession) => void
+  ): Promise<ViewerSession> {
+    const session = new ViewerSession(context, leftSource, rightSource, onFocus, panel);
+    await session.refresh();
+    return session;
+  }
+
   async refresh(): Promise<void> {
     const [leftMetadata, rightMetadata] = await Promise.all([
       this.leftSource.getMetadata(),
@@ -84,25 +101,7 @@ export class ViewerSession implements vscode.Disposable {
   }
 
   async gotoLine(): Promise<void> {
-    const totalLines = this.getTotalLines();
-    const raw = await vscode.window.showInputBox({
-      placeHolder: `1 - ${totalLines}`,
-      prompt: 'Go to display line (8 values per line)',
-      validateInput: (value) => {
-        const parsed = Number.parseInt(value, 10);
-        if (!Number.isFinite(parsed) || parsed < 1 || parsed > totalLines) {
-          return `Enter an integer between 1 and ${totalLines}.`;
-        }
-        return undefined;
-      }
-    });
-
-    if (!raw) {
-      return;
-    }
-
-    const lineNumber = Number.parseInt(raw, 10);
-    this.panel.webview.postMessage({ type: 'gotoLine', lineNumber });
+    this.panel.webview.postMessage({ type: 'focusGoto' });
   }
 
   async reshape(): Promise<void> {
@@ -181,7 +180,9 @@ export class ViewerSession implements vscode.Disposable {
       await this.refresh();
       this.panel.webview.postMessage({ type: 'clearRows' });
     } catch (error) {
-      void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      this.panel.webview.postMessage({ type: 'error', message });
+      void vscode.window.showErrorMessage(message);
     }
   }
 
@@ -211,6 +212,16 @@ export class ViewerSession implements vscode.Disposable {
         } else if (message.command === 'reload') {
           await this.refresh();
           this.panel.webview.postMessage({ type: 'clearRows' });
+        }
+        break;
+      case 'applyTransform':
+        if (typeof message.mode === 'string' && typeof message.value === 'string') {
+          await this.applyTransformRequest(message.mode, message.value);
+        }
+        break;
+      case 'runConsole':
+        if (typeof message.mode === 'string' && typeof message.value === 'string') {
+          await this.runConsoleRequest(message.mode, message.value);
         }
         break;
       default:
@@ -279,6 +290,7 @@ export class ViewerSession implements vscode.Disposable {
     const state: ViewerState = {
       rowsPerLine: ELEMENTS_PER_LINE,
       totalLines: this.getTotalLines(),
+      maxElements: this.getMaxElements(),
       left: this.leftMetadata,
       right: this.rightMetadata,
       canTransform: this.canTransform(),
@@ -296,14 +308,131 @@ export class ViewerSession implements vscode.Disposable {
   }
 
   private getTotalLines(): number {
+    return Math.max(1, Math.ceil(this.getMaxElements() / ELEMENTS_PER_LINE));
+  }
+
+  private getMaxElements(): number {
     const leftTotal = this.leftMetadata?.totalElements ?? 0;
     const rightTotal = this.rightMetadata?.totalElements ?? 0;
-    return Math.max(1, Math.ceil(Math.max(leftTotal, rightTotal) / ELEMENTS_PER_LINE));
+    return Math.max(leftTotal, rightTotal);
   }
 
   private async syncContexts(): Promise<void> {
     await vscode.commands.executeCommand('setContext', 'binView.viewerFocused', this.panel.active && !this.disposed);
     await vscode.commands.executeCommand('setContext', 'binView.canTransform', this.panel.active && this.canTransform());
+  }
+
+  private async applyTransformRequest(mode: string, value: string): Promise<void> {
+    if (!this.canTransform()) {
+      this.panel.webview.postMessage({ type: 'error', message: 'The active viewer does not support torch transforms.' });
+      return;
+    }
+
+    try {
+      const normalizedMode = mode.trim().toLowerCase();
+      if (normalizedMode === 'reset') {
+        await this.resetTransform();
+        return;
+      }
+
+      if (normalizedMode === 'reshape') {
+        const shape = parseShapeInput(value);
+        await this.applyTransform(async (source) => {
+          if (!source.reshape) {
+            throw new Error('This source does not support reshape.');
+          }
+          return source.reshape(shape);
+        });
+        return;
+      }
+
+      if (normalizedMode === 'slice') {
+        await this.applyTransform(async (source) => {
+          if (!source.slice) {
+            throw new Error('This source does not support slicing.');
+          }
+          return source.slice(value);
+        });
+        return;
+      }
+
+      if (normalizedMode === 'python') {
+        await this.applyTransform(async (source) => {
+          if (!source.applyPython) {
+            throw new Error('This source does not support Python tensor expressions.');
+          }
+          return source.applyPython(value);
+        });
+        return;
+      }
+
+      this.panel.webview.postMessage({ type: 'error', message: `Unknown transform mode: ${mode}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.panel.webview.postMessage({ type: 'error', message });
+      void vscode.window.showErrorMessage(message);
+    }
+  }
+
+  private async runConsoleRequest(mode: string, value: string): Promise<void> {
+    if (!this.canTransform()) {
+      this.panel.webview.postMessage({ type: 'error', message: 'The active viewer does not support torch transforms.' });
+      return;
+    }
+
+    try {
+      const normalizedMode = mode.trim().toLowerCase();
+      if (normalizedMode === 'reset') {
+        await this.resetTransform();
+        this.panel.webview.postMessage({
+          type: 'consoleResult',
+          mode: normalizedMode,
+          command: 'reset',
+          entries: [
+            {
+              label: this.rightSource ? 'Both' : 'Tensor',
+              output: 'Tensor reset to the original selection.',
+              updated: true
+            }
+          ]
+        });
+        return;
+      }
+
+      const code = buildConsoleSource(normalizedMode, value);
+      const sources = [this.leftSource, this.rightSource].filter((source): source is BinarySource => Boolean(source));
+      const results = await Promise.all(sources.map(async (source, index) => {
+        if (!source.runConsole) {
+          throw new Error('This source does not support the Python console.');
+        }
+
+        const result = await source.runConsole(code);
+        const label = this.rightSource ? (index === 0 ? 'Left' : 'Right') : 'Tensor';
+        return {
+          label,
+          output: result.output,
+          resultText: result.resultText,
+          updated: result.updated,
+          raw: result
+        };
+      }));
+
+      if (results.some((entry) => entry.raw.updated)) {
+        await this.refresh();
+        this.panel.webview.postMessage({ type: 'clearRows' });
+      }
+
+      this.panel.webview.postMessage({
+        type: 'consoleResult',
+        mode: normalizedMode,
+        command: normalizedMode === 'python' ? value : code,
+        entries: results.map(({ raw, ...entry }) => entry)
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.panel.webview.postMessage({ type: 'error', message });
+      void vscode.window.showErrorMessage(message);
+    }
   }
 
   private renderHtml(): string {
@@ -324,14 +453,17 @@ export class ViewerSession implements vscode.Disposable {
       --muted: var(--vscode-descriptionForeground);
       --bg-subtle: color-mix(in srgb, var(--vscode-editor-background) 92%, white 8%);
       --diff: color-mix(in srgb, var(--vscode-editorError-foreground) 18%, transparent);
+      --focus: color-mix(in srgb, var(--vscode-focusBorder) 60%, transparent);
+      --focus-strong: color-mix(in srgb, var(--vscode-focusBorder) 22%, transparent);
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; margin: 0; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); }
     body { display: flex; flex-direction: column; font-family: var(--vscode-font-family); }
     .toolbar {
       display: flex;
-      gap: 8px;
-      align-items: center;
+      gap: 10px;
+      align-items: end;
+      flex-wrap: wrap;
       padding: 10px 12px;
       border-bottom: 1px solid var(--border);
       background: var(--vscode-sideBar-background);
@@ -339,16 +471,59 @@ export class ViewerSession implements vscode.Disposable {
       top: 0;
       z-index: 5;
     }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .field span {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .jump-field {
+      width: min(320px, 100%);
+    }
+    .toolbar-actions {
+      display: flex;
+      gap: 10px;
+      margin-left: auto;
+    }
+    .toolbar input,
+    .toolbar select,
     .toolbar button {
       border: 1px solid var(--border);
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      padding: 7px 10px;
+      min-height: 34px;
+      font: inherit;
+    }
+    .toolbar input,
+    .toolbar select {
+      width: 100%;
+    }
+    .toolbar input:focus,
+    .toolbar select:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 0;
+    }
+    .toolbar button {
       background: var(--vscode-button-secondaryBackground);
       color: var(--vscode-button-secondaryForeground);
-      padding: 4px 10px;
       cursor: pointer;
     }
     .toolbar button.primary {
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
+    }
+    .toolbar button:disabled,
+    .toolbar input:disabled,
+    .toolbar select:disabled {
+      opacity: 0.6;
+      cursor: default;
     }
     .summary {
       display: flex;
@@ -361,6 +536,289 @@ export class ViewerSession implements vscode.Disposable {
       font-size: 12px;
     }
     .summary strong { color: var(--vscode-textLink-foreground); }
+    .main-shell {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .viewer-shell {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .console-dock {
+      display: grid;
+      grid-template-columns: 46px 0;
+      min-height: 0;
+      border-left: 1px solid var(--border);
+      background: var(--vscode-sideBar-background);
+      transition: grid-template-columns 160ms ease;
+    }
+    .console-dock[data-open="true"] {
+      grid-template-columns: 46px minmax(320px, 420px);
+    }
+    .console-dock-toggle {
+      border: 0;
+      border-right: 1px solid var(--border);
+      background:
+        linear-gradient(180deg, color-mix(in srgb, var(--vscode-sideBar-background) 82%, var(--vscode-editor-background) 18%), color-mix(in srgb, var(--vscode-editor-background) 84%, black 16%));
+      color: var(--vscode-sideBar-foreground);
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      writing-mode: vertical-rl;
+      transform: rotate(180deg);
+      padding: 14px 10px;
+    }
+    .console-dock-toggle:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+    .console-shell {
+      display: none;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      grid-template-rows: auto auto minmax(160px, 1fr);
+      gap: 12px;
+      padding: 14px 12px 12px;
+      background:
+        radial-gradient(circle at top right, color-mix(in srgb, var(--vscode-textLink-foreground) 18%, transparent), transparent 34%),
+        linear-gradient(135deg, color-mix(in srgb, var(--vscode-sideBar-background) 86%, var(--vscode-editor-background) 14%), color-mix(in srgb, var(--vscode-editor-background) 88%, black 12%));
+      overflow: auto;
+    }
+    .console-dock[data-open="true"] .console-shell {
+      display: grid;
+    }
+    .console-shell input,
+    .console-shell select,
+    .console-shell textarea,
+    .console-shell button {
+      border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+      background: color-mix(in srgb, var(--vscode-input-background) 88%, var(--vscode-editor-background) 12%);
+      color: var(--vscode-input-foreground);
+      font: inherit;
+    }
+    .console-shell input:focus,
+    .console-shell select:focus,
+    .console-shell textarea:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 0;
+    }
+    .console-shell button {
+      min-height: 36px;
+      padding: 8px 12px;
+      cursor: pointer;
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--vscode-button-secondaryBackground) 88%, var(--vscode-editor-background) 12%);
+      color: var(--vscode-button-secondaryForeground);
+    }
+    .console-shell button.primary {
+      background: linear-gradient(135deg, var(--vscode-button-background), color-mix(in srgb, var(--vscode-button-background) 76%, black 24%));
+      color: var(--vscode-button-foreground);
+    }
+    .console-shell button:disabled,
+    .console-shell input:disabled,
+    .console-shell select:disabled,
+    .console-shell textarea:disabled {
+      opacity: 0.58;
+      cursor: default;
+    }
+    .console-hero {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }
+    .console-title {
+      min-width: 0;
+    }
+    .console-kicker {
+      margin-bottom: 6px;
+      color: var(--vscode-textLink-foreground);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .console-title strong {
+      display: block;
+      font-size: 18px;
+      line-height: 1.2;
+    }
+    .console-title p {
+      margin: 8px 0 0;
+      max-width: 720px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .console-head-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+    .console-chip {
+      padding: 8px 12px;
+      border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 84%, white 16%);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .console-stage {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      align-items: stretch;
+    }
+    .console-controls,
+    .console-editor {
+      border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 90%, white 10%);
+      box-shadow: 0 10px 28px color-mix(in srgb, black 10%, transparent);
+    }
+    .console-controls {
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+    }
+    .console-controls .field input,
+    .console-controls .field select {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px;
+      border-radius: 12px;
+    }
+    .console-inline-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .console-support {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .console-editor {
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+      min-width: 0;
+      transition: opacity 140ms ease, transform 140ms ease;
+    }
+    .console-editor[data-open="false"] {
+      opacity: 0.72;
+    }
+    .console-editor[data-open="false"] .console-input,
+    .console-editor[data-open="false"] .console-editor-actions {
+      display: none;
+    }
+    .console-editor-head {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }
+    .console-editor-title {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .console-editor-hint {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+      max-width: 540px;
+    }
+    .console-input {
+      width: 100%;
+      min-height: 160px;
+      padding: 12px;
+      resize: vertical;
+      border-radius: 14px;
+      white-space: pre;
+      font-family: var(--vscode-editor-font-family, monospace);
+    }
+    .console-editor-actions {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+    .console-log {
+      margin: 0;
+      min-height: 140px;
+      max-height: 280px;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 88%, black 12%);
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      line-height: 1.45;
+      box-shadow: inset 0 1px 0 color-mix(in srgb, white 8%, transparent);
+    }
+    .console-log.empty {
+      color: var(--muted);
+    }
+    .console-entry + .console-entry {
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+    }
+    .console-entry-label {
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .console-entry pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .console-code {
+      color: var(--vscode-textLink-foreground);
+      margin-bottom: 6px;
+    }
+    .console-output {
+      color: var(--vscode-terminal-ansiGreen, var(--vscode-editor-foreground));
+      margin-top: 6px;
+    }
+    .console-result {
+      color: var(--vscode-editor-foreground);
+      margin-top: 6px;
+    }
+    @media (max-width: 1100px) {
+      .main-shell {
+        grid-template-columns: 1fr;
+      }
+      .console-dock {
+        grid-template-columns: 1fr;
+        border-left: 0;
+        border-top: 1px solid var(--border);
+      }
+      .console-dock[data-open="true"] {
+        grid-template-columns: 1fr;
+      }
+      .console-dock-toggle {
+        writing-mode: horizontal-tb;
+        transform: none;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+        padding: 10px 12px;
+      }
+    }
     .viewer {
       flex: 1;
       overflow: auto;
@@ -378,6 +836,12 @@ export class ViewerSession implements vscode.Disposable {
       min-height: var(--line-height);
       border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
     }
+    .row.target-line {
+      background: var(--focus-strong);
+    }
+    .row.target-line .line-number {
+      background: var(--focus-strong);
+    }
     .line-number {
       width: var(--line-gutter);
       padding: 10px;
@@ -394,25 +858,32 @@ export class ViewerSession implements vscode.Disposable {
       margin-top: 4px;
     }
     .side {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(8, minmax(0, 1fr));
       gap: 0;
       padding: 6px;
-      min-width: calc(var(--cell-width) * 8 + 12px);
+      flex: 1 1 0;
+      min-width: 0;
     }
     .cell {
-      width: var(--cell-width);
-      min-width: var(--cell-width);
+      width: auto;
+      min-width: 0;
       padding: 6px 8px;
       border-right: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 12px;
+      font-size: 11px;
       background: transparent;
+      overflow: hidden;
     }
     .cell.compare-gap {
       border-left: 2px solid var(--border);
     }
     .cell.diff {
       background: var(--diff);
+    }
+    .cell.target-cell {
+      background: var(--focus-strong);
+      box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);
     }
     .cell.empty {
       color: var(--muted);
@@ -421,14 +892,17 @@ export class ViewerSession implements vscode.Disposable {
     .cell .offset {
       color: var(--muted);
       margin-bottom: 4px;
+      overflow-wrap: anywhere;
     }
     .cell .value {
       font-weight: 600;
       margin-bottom: 4px;
+      overflow-wrap: anywhere;
     }
     .cell .hex {
       color: var(--muted);
       line-height: 1.35;
+      overflow-wrap: anywhere;
     }
     .status {
       padding: 8px 12px;
@@ -436,41 +910,304 @@ export class ViewerSession implements vscode.Disposable {
       border-top: 1px solid var(--border);
       min-height: 34px;
     }
+    .status[data-kind="info"] {
+      color: var(--vscode-descriptionForeground);
+    }
+    .status[data-kind="success"] {
+      color: var(--vscode-testing-iconPassed);
+    }
   </style>
 </head>
 <body>
   <div class="toolbar">
-    <button class="primary" data-command="goto">Go To Line</button>
-    <button data-command="reload">Reload</button>
-    <button data-command="reshape" id="reshapeBtn">Reshape</button>
-    <button data-command="slice" id="sliceBtn">Slice</button>
-    <button data-command="reset" id="resetBtn">Reset Transform</button>
+    <label class="field jump-field">
+      <span>Jump</span>
+      <input id="jumpInput" type="text" spellcheck="false" placeholder="Index: #128 or #64*2, line: L16">
+    </label>
+    <div class="toolbar-actions">
+      <button type="button" id="reloadBtn" data-command="reload">Reload</button>
+    </div>
   </div>
   <div class="summary" id="summary"></div>
-  <div class="viewer" id="viewer" tabindex="0">
-    <div class="content" id="content"></div>
+  <div class="main-shell">
+    <div class="viewer-shell">
+      <div class="viewer" id="viewer" tabindex="0">
+        <div class="content" id="content"></div>
+      </div>
+      <div class="status" id="status"></div>
+    </div>
+    <aside class="console-dock" id="consoleDock" data-open="false">
+      <button class="console-dock-toggle" type="button" id="toggleConsoleDockBtn" aria-expanded="false">Python</button>
+      <section class="console-shell">
+        <div class="console-hero">
+          <div class="console-title">
+            <div class="console-kicker">Torch Workspace</div>
+            <strong>Python Side Panel</strong>
+            <p>Python stays hidden by default. Open this right-hand panel only when you need reshape, slice, reset, or free-form torch commands.</p>
+          </div>
+          <div class="console-head-actions">
+            <div class="console-chip" id="consoleStateChip">Panel hidden</div>
+            <button class="primary" type="button" id="toggleConsoleBtn">Open Python</button>
+            <button type="button" id="clearConsoleBtn">Clear Log</button>
+            <button type="button" id="closeDockBtn">Hide Panel</button>
+          </div>
+        </div>
+        <div class="console-stage">
+          <div class="console-controls">
+            <label class="field">
+              <span>Action</span>
+              <select id="transformMode">
+                <option value="python">Python / Torch</option>
+                <option value="reshape">Reshape Helper</option>
+                <option value="slice">Slice Helper</option>
+                <option value="reset">Reset</option>
+              </select>
+            </label>
+            <label class="field" id="helperField">
+              <span id="helperLabel">Helper Input</span>
+              <input id="helperInput" type="text" spellcheck="false" placeholder="1, 32, -1">
+            </label>
+            <div class="console-inline-actions">
+              <button class="primary" type="button" id="runHelperBtn">Run Helper</button>
+              <button type="button" id="insertExampleBtn">Insert Example</button>
+            </div>
+            <div class="console-support" id="consoleSupportText">Python input is hidden by default. Open the panel and switch to <code>Python / Torch</code> when you want multi-line commands.</div>
+          </div>
+          <form class="console-editor" id="consoleForm" data-open="false">
+            <div class="console-editor-head">
+              <div class="console-editor-title">Python Editor</div>
+              <div class="console-editor-hint"><code>tensor</code>, <code>torch</code>, and <code>math</code> are available. <code>Ctrl+Enter</code> runs the current block.</div>
+            </div>
+            <textarea id="transformInput" class="console-input" spellcheck="false" placeholder="print(tensor.shape)&#10;tensor.permute(0, 2, 1)"></textarea>
+            <div class="console-editor-actions">
+              <button class="primary" type="submit" id="applyBtn">Run Python</button>
+              <button type="button" id="closeConsoleBtn">Close Editor</button>
+            </div>
+          </form>
+        </div>
+        <div class="console-log empty" id="consoleLog">No console output yet.</div>
+      </section>
+    </aside>
   </div>
-  <div class="status" id="status"></div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const viewer = document.getElementById('viewer');
     const content = document.getElementById('content');
     const summary = document.getElementById('summary');
     const statusEl = document.getElementById('status');
+    const consoleDock = document.getElementById('consoleDock');
+    const toggleConsoleDockBtn = document.getElementById('toggleConsoleDockBtn');
+    const consoleLog = document.getElementById('consoleLog');
+    const consoleForm = document.getElementById('consoleForm');
+    const consoleStateChip = document.getElementById('consoleStateChip');
+    const consoleSupportText = document.getElementById('consoleSupportText');
+    const clearConsoleBtn = document.getElementById('clearConsoleBtn');
+    const closeDockBtn = document.getElementById('closeDockBtn');
+    const toggleConsoleBtn = document.getElementById('toggleConsoleBtn');
+    const closeConsoleBtn = document.getElementById('closeConsoleBtn');
+    const insertExampleBtn = document.getElementById('insertExampleBtn');
+    const jumpInput = document.getElementById('jumpInput');
+    const transformMode = document.getElementById('transformMode');
+    const helperField = document.getElementById('helperField');
+    const helperLabel = document.getElementById('helperLabel');
+    const helperInput = document.getElementById('helperInput');
+    const runHelperBtn = document.getElementById('runHelperBtn');
+    const transformInput = document.getElementById('transformInput');
+    const applyBtn = document.getElementById('applyBtn');
+    const reloadBtn = document.getElementById('reloadBtn');
     const rowHeight = 112;
     const cache = new Map();
     let state = undefined;
     let lastRequestKey = '';
     let requestId = 0;
+    let highlighted = undefined;
+    let jumpTimer = undefined;
+    let transformBusy = false;
+    let consoleDockOpen = false;
+    let consoleEditorOpen = false;
+    let consoleEntries = [];
+    const pythonExample = 'print(tensor.shape)\\ntensor.permute(0, 2, 1)';
+    const helperPlaceholders = {
+      reshape: '1, 32, -1',
+      slice: ':, 0, :128',
+      reset: 'Reset returns to the original tensor'
+    };
+    const helperExamples = {
+      reshape: '1, 32, -1',
+      slice: ':, 0, :128',
+      reset: ''
+    };
+    const helperLabels = {
+      reshape: 'Shape',
+      slice: 'Slice Expression',
+      reset: 'Reset'
+    };
 
-    function updateButtons() {
-      const enabled = Boolean(state && state.canTransform);
-      document.getElementById('reshapeBtn').disabled = !enabled;
-      document.getElementById('sliceBtn').disabled = !enabled;
-      document.getElementById('resetBtn').disabled = !enabled;
+    function isTransformEnabled() {
+      return Boolean(state && state.canTransform);
     }
 
-    function setStatus(message = '') {
+    function focusPythonEditor() {
+      if (transformInput.disabled || !consoleDockOpen) {
+        return;
+      }
+      transformInput.focus();
+      transformInput.setSelectionRange(transformInput.value.length, transformInput.value.length);
+    }
+
+    function openConsoleDock(options = {}) {
+      const { focusPython = false, silent = false } = options;
+      consoleDockOpen = true;
+      updateControls({ focusPython });
+      if (!silent) {
+        setStatus('Python panel opened.', 'info');
+      }
+    }
+
+    function closeConsoleDock() {
+      consoleDockOpen = false;
+      updateControls();
+      if (statusEl.dataset.kind !== 'error') {
+        setStatus('Python panel hidden.', 'info');
+      }
+    }
+
+    function updateControls(options = {}) {
+      const { focusPython = false } = options;
+      const transformEnabled = isTransformEnabled();
+      const mode = transformMode.value;
+      const pythonMode = mode === 'python';
+      const helperNeedsValue = mode === 'reshape' || mode === 'slice';
+      const helperVisible = !pythonMode && mode !== 'reset';
+
+      consoleDock.dataset.open = consoleDockOpen ? 'true' : 'false';
+      toggleConsoleDockBtn.textContent = consoleDockOpen ? 'Hide Python' : 'Python';
+      toggleConsoleDockBtn.setAttribute('aria-expanded', consoleDockOpen ? 'true' : 'false');
+      jumpInput.disabled = !state;
+      transformMode.disabled = !transformEnabled || transformBusy;
+      reloadBtn.disabled = transformBusy;
+      clearConsoleBtn.disabled = transformBusy || consoleEntries.length === 0;
+      closeDockBtn.disabled = !consoleDockOpen;
+      helperField.hidden = !helperVisible;
+      helperLabel.textContent = helperLabels[mode] || 'Helper Input';
+      helperInput.disabled = !transformEnabled || transformBusy || !helperVisible;
+      helperInput.placeholder = helperPlaceholders[mode] || '';
+      runHelperBtn.hidden = pythonMode;
+      runHelperBtn.disabled = !transformEnabled || transformBusy || (helperNeedsValue && !helperInput.value.trim());
+      runHelperBtn.textContent = mode === 'reset' ? 'Reset Tensor' : 'Run Helper';
+      insertExampleBtn.disabled = !transformEnabled || transformBusy || (pythonMode ? false : mode === 'reset');
+      insertExampleBtn.textContent = pythonMode ? 'Insert Python Example' : 'Insert Example';
+      consoleForm.hidden = !pythonMode;
+      consoleForm.dataset.open = consoleEditorOpen ? 'true' : 'false';
+      transformInput.disabled = !transformEnabled || transformBusy || !pythonMode || !consoleEditorOpen || !consoleDockOpen;
+      transformInput.placeholder = pythonExample;
+      applyBtn.disabled = !transformEnabled || transformBusy || !pythonMode || !consoleEditorOpen || !consoleDockOpen || !transformInput.value.trim();
+      toggleConsoleBtn.disabled = !transformEnabled || transformBusy;
+      toggleConsoleBtn.textContent = pythonMode ? (consoleEditorOpen ? 'Focus Editor' : 'Open Python') : 'Switch To Python';
+      closeConsoleBtn.disabled = !transformEnabled || transformBusy || !pythonMode || !consoleEditorOpen;
+      if (!consoleDockOpen) {
+        consoleStateChip.textContent = 'Panel hidden';
+      } else if (pythonMode) {
+        consoleStateChip.textContent = consoleEditorOpen ? 'Python input active' : 'Python input closed';
+      } else {
+        consoleStateChip.textContent = mode === 'reset' ? 'Reset helper ready' : 'Helper mode ready';
+      }
+
+      if (!transformEnabled) {
+        consoleSupportText.innerHTML = 'Python control is available only when the current viewer is backed by a torch tensor.';
+      } else if (pythonMode) {
+        consoleSupportText.innerHTML = consoleEditorOpen
+          ? 'Multi-line Python is live. Return a tensor, or assign back into <code>tensor</code>, then press <code>Ctrl+Enter</code> to run.'
+          : 'Python input stays closed by default. Click <code>Open Python</code> when you want to edit and run commands.';
+      } else if (mode === 'reshape') {
+        consoleSupportText.innerHTML = 'Quick helper runs <code>tensor = tensor.reshape(...)</code> and refreshes the viewer in place.';
+      } else if (mode === 'slice') {
+        consoleSupportText.innerHTML = 'Quick helper runs <code>tensor = tensor[...]</code> using Python-style indexing.';
+      } else {
+        consoleSupportText.innerHTML = 'Reset restores the original tensor selection and clears the current transform chain.';
+      }
+
+      if (focusPython && pythonMode && consoleEditorOpen) {
+        focusPythonEditor();
+      }
+    }
+
+    function openPythonEditor(options = {}) {
+      const { silent = false } = options;
+      if (!isTransformEnabled() || transformBusy) {
+        return;
+      }
+      transformMode.value = 'python';
+      consoleDockOpen = true;
+      consoleEditorOpen = true;
+      updateControls({ focusPython: true });
+      if (!silent) {
+        setStatus('Python editor opened.', 'info');
+      }
+    }
+
+    function closePythonEditor() {
+      consoleEditorOpen = false;
+      updateControls();
+      if (isTransformEnabled()) {
+        setStatus('Python editor closed.', 'info');
+      }
+    }
+
+    function startConsoleRun(mode, value) {
+      if (!isTransformEnabled()) {
+        return;
+      }
+      transformBusy = true;
+      updateControls();
+      if (mode === 'python') {
+        setStatus('Running Python console...', 'info');
+      } else if (mode === 'reset') {
+        setStatus('Resetting tensor...', 'info');
+      } else {
+        setStatus('Applying ' + mode + ' helper...', 'info');
+      }
+      vscode.postMessage({ type: 'runConsole', mode, value });
+    }
+
+    function renderConsole() {
+      if (consoleEntries.length === 0) {
+        consoleLog.classList.add('empty');
+        consoleLog.textContent = 'No console output yet.';
+        return;
+      }
+
+      consoleLog.classList.remove('empty');
+      consoleLog.innerHTML = consoleEntries.map((entry, index) => {
+        const rows = entry.entries.map((item) => {
+          const segments = [
+            '<div class="console-entry-label">' + escapeHtml(item.label) + (item.updated ? ' | view updated' : '') + '</div>'
+          ];
+          if (item.output) {
+            segments.push('<pre class="console-output">' + escapeHtml(item.output) + '</pre>');
+          }
+          if (item.resultText) {
+            segments.push('<pre class="console-result">' + escapeHtml(item.resultText) + '</pre>');
+          }
+          if (!item.output && !item.resultText) {
+            segments.push('<pre class="console-output">Command completed.</pre>');
+          }
+          return segments.join('');
+        }).join('');
+
+        return [
+          '<div class="console-entry">',
+          '<div class="console-entry-label">In [' + (index + 1) + '] ' + escapeHtml(entry.mode) + '</div>',
+          '<pre class="console-code">' + escapeHtml(entry.command) + '</pre>',
+          rows,
+          '</div>'
+        ].join('');
+      }).join('');
+      consoleLog.scrollTop = consoleLog.scrollHeight;
+    }
+
+    function setStatus(message = '', kind = 'error') {
+      statusEl.dataset.kind = message ? kind : '';
       statusEl.textContent = message;
     }
 
@@ -527,6 +1264,233 @@ export class ViewerSession implements vscode.Disposable {
       vscode.postMessage({ type: 'viewport', startLine: start, lineCount: count, requestId });
     }
 
+    function clearHighlight() {
+      highlighted = undefined;
+      render();
+    }
+
+    function focusJumpInput() {
+      jumpInput.focus();
+      jumpInput.select();
+    }
+
+    function tokenizeIndexExpression(input) {
+      const tokens = [];
+      let position = 0;
+      while (position < input.length) {
+        const remaining = input.slice(position);
+        const whitespace = remaining.match(/^\\s+/);
+        if (whitespace) {
+          position += whitespace[0].length;
+          continue;
+        }
+
+        const operator = remaining.match(/^(\\*\\*|\\/\\/|[()+\\-*/%])/);
+        if (operator) {
+          tokens.push(operator[0]);
+          position += operator[0].length;
+          continue;
+        }
+
+        const number = remaining.match(/^\\d+/);
+        if (number) {
+          tokens.push(number[0]);
+          position += number[0].length;
+          continue;
+        }
+
+        throw new Error('Only integers, parentheses, and + - * / // % ** operators are supported in index expressions.');
+      }
+
+      return tokens;
+    }
+
+    function evaluateIndexExpression(raw) {
+      const value = raw.trim().replace(/^#\\s*/, '');
+      if (!value) {
+        throw new Error('Enter an index expression after #.');
+      }
+
+      const tokens = tokenizeIndexExpression(value);
+      let index = 0;
+
+      function peek() {
+        return tokens[index];
+      }
+
+      function consume(token) {
+        if (tokens[index] !== token) {
+          throw new Error('Invalid index expression.');
+        }
+        index += 1;
+      }
+
+      function ensureFinite(valueToCheck) {
+        if (!Number.isFinite(valueToCheck)) {
+          throw new Error('Index expression is too large to evaluate.');
+        }
+        return valueToCheck;
+      }
+
+      function parsePrimary() {
+        const token = peek();
+        if (token === '(') {
+          consume('(');
+          const inner = parseExpression();
+          if (peek() !== ')') {
+            throw new Error('Missing closing parenthesis in index expression.');
+          }
+          consume(')');
+          return inner;
+        }
+
+        if (token && /^\\d+$/.test(token)) {
+          index += 1;
+          return Number.parseInt(token, 10);
+        }
+
+        throw new Error('Invalid index expression.');
+      }
+
+      function parseUnary() {
+        const token = peek();
+        if (token === '+' || token === '-') {
+          index += 1;
+          const valueToCheck = parseUnary();
+          return ensureFinite(token === '-' ? -valueToCheck : valueToCheck);
+        }
+        return parsePrimary();
+      }
+
+      function parsePower() {
+        let left = parseUnary();
+        if (peek() === '**') {
+          consume('**');
+          const right = parsePower();
+          left = ensureFinite(left ** right);
+        }
+        return left;
+      }
+
+      function parseTerm() {
+        let left = parsePower();
+        while (true) {
+          const token = peek();
+          if (token !== '*' && token !== '/' && token !== '//' && token !== '%') {
+            return left;
+          }
+
+          index += 1;
+          const right = parsePower();
+          if ((token === '/' || token === '//' || token === '%') && right === 0) {
+            throw new Error('Division by zero is not allowed in index expressions.');
+          }
+
+          if (token === '*') {
+            left = ensureFinite(left * right);
+          } else if (token === '/') {
+            left = ensureFinite(left / right);
+          } else if (token === '//') {
+            left = ensureFinite(Math.floor(left / right));
+          } else {
+            left = ensureFinite(left % right);
+          }
+        }
+      }
+
+      function parseExpression() {
+        let left = parseTerm();
+        while (true) {
+          const token = peek();
+          if (token !== '+' && token !== '-') {
+            return left;
+          }
+          index += 1;
+          const right = parseTerm();
+          left = ensureFinite(token === '+' ? left + right : left - right);
+        }
+      }
+
+      const result = parseExpression();
+      if (index !== tokens.length) {
+        throw new Error('Invalid index expression.');
+      }
+      if (!Number.isInteger(result) || result < 0) {
+        throw new Error('Index expression must evaluate to a non-negative integer.');
+      }
+      return result;
+    }
+
+    function parseJumpTarget(raw) {
+      if (!state) {
+        return { error: 'Viewer is not ready yet.' };
+      }
+
+      const value = raw.trim();
+      if (!value) {
+        return undefined;
+      }
+
+      const lineMatch = value.match(/^l(?:ine)?\\s*[:#]?\\s*(\\d+)$/i);
+      if (lineMatch) {
+        const lineNumber = Number.parseInt(lineMatch[1], 10);
+        if (!Number.isFinite(lineNumber) || lineNumber < 1 || lineNumber > state.totalLines) {
+          return { error: 'Line must be between 1 and ' + state.totalLines + '.' };
+        }
+        return {
+          lineNumber,
+          message: 'Jumped to line L' + lineNumber + '.'
+        };
+      }
+
+      const looksLikeIndex = /^#/.test(value) || /^[\\d(+-]/.test(value);
+      if (looksLikeIndex) {
+        if (state.maxElements <= 0) {
+          return { error: 'The current view has no elements to jump to.' };
+        }
+
+        let index;
+        try {
+          index = evaluateIndexExpression(value);
+        } catch (error) {
+          return { error: error instanceof Error ? error.message : String(error) };
+        }
+
+        if (!Number.isFinite(index) || index < 0 || index >= state.maxElements) {
+          return { error: 'Index must be between 0 and ' + Math.max(0, state.maxElements - 1) + '.' };
+        }
+        return {
+          lineNumber: Math.floor(index / state.rowsPerLine) + 1,
+          index,
+          message: 'Jumped to index #' + index + '.'
+        };
+      }
+
+      return { error: 'Use #128 or #64*2 for an index, or L16 for a display line.' };
+    }
+
+    function applyJump(raw, showErrors) {
+      const target = parseJumpTarget(raw);
+      if (!target) {
+        setStatus('', 'info');
+        clearHighlight();
+        return false;
+      }
+      if (target.error) {
+        if (showErrors) {
+          setStatus(target.error, 'error');
+        }
+        return false;
+      }
+
+      highlighted = target;
+      viewer.scrollTop = (target.lineNumber - 1) * rowHeight;
+      requestVisibleRows();
+      render();
+      setStatus(target.message, 'info');
+      return true;
+    }
+
     function render() {
       if (!state) {
         return;
@@ -547,21 +1511,24 @@ export class ViewerSession implements vscode.Disposable {
         const row = document.createElement('div');
         row.className = 'row';
         row.style.top = (line * rowHeight) + 'px';
+        if (highlighted && highlighted.lineNumber === item.lineNumber) {
+          row.classList.add('target-line');
+        }
 
         const number = document.createElement('div');
         number.className = 'line-number';
         number.innerHTML = '<div>L' + item.lineNumber + '</div><div class="index">#' + item.startIndex + '</div>';
         row.appendChild(number);
 
-        row.appendChild(renderSide(item.left, false, item.different, item.right));
+        row.appendChild(renderSide(item.left, false, item.different, item.right, item.startIndex, item.lineNumber));
         if (item.right) {
-          row.appendChild(renderSide(item.right, true, item.different, item.left));
+          row.appendChild(renderSide(item.right, true, item.different, item.left, item.startIndex, item.lineNumber));
         }
         content.appendChild(row);
       }
     }
 
-    function renderSide(values, compare, different, baseline) {
+    function renderSide(values, compare, different, baseline, startIndex, lineNumber) {
       const side = document.createElement('div');
       side.className = 'side';
 
@@ -576,6 +1543,9 @@ export class ViewerSession implements vscode.Disposable {
         const isDiff = baseline && ((value && leftValue && value.bits !== leftValue.bits) || (!value && leftValue) || (value && !leftValue));
         if (isDiff) {
           cell.classList.add('diff');
+        }
+        if (highlighted && highlighted.index === startIndex + index && highlighted.lineNumber === lineNumber) {
+          cell.classList.add('target-cell');
         }
 
         if (!value) {
@@ -603,9 +1573,13 @@ export class ViewerSession implements vscode.Disposable {
         state = message.state;
         cache.clear();
         lastRequestKey = '';
-        setStatus('');
+        transformBusy = false;
+        if (highlighted && highlighted.index !== undefined && highlighted.index >= state.maxElements) {
+          highlighted = undefined;
+        }
+        setStatus('', 'info');
         renderSummary();
-        updateButtons();
+        updateControls();
         requestVisibleRows();
       } else if (message.type === 'rows') {
         if (message.requestId !== requestId) {
@@ -614,21 +1588,40 @@ export class ViewerSession implements vscode.Disposable {
         for (const line of message.lines) {
           cache.set(line.lineNumber, line);
         }
-        setStatus('');
-        render();
-      } else if (message.type === 'gotoLine') {
-        if (!state) {
-          return;
+        if (!statusEl.textContent || statusEl.dataset.kind !== 'error') {
+          setStatus(statusEl.textContent, statusEl.dataset.kind || 'info');
         }
-        const target = Math.max(1, Math.min(state.totalLines, Number(message.lineNumber))) - 1;
-        viewer.scrollTop = target * rowHeight;
-        requestVisibleRows();
+        render();
+      } else if (message.type === 'focusGoto') {
+        focusJumpInput();
       } else if (message.type === 'clearRows') {
         cache.clear();
         lastRequestKey = '';
         requestVisibleRows();
+        render();
+      } else if (message.type === 'consoleResult') {
+        transformBusy = false;
+        updateControls();
+        const mode = message.mode || transformMode.value;
+        const entries = Array.isArray(message.entries) ? message.entries : [];
+        consoleEntries.push({
+          mode,
+          command: message.command || '',
+          entries
+        });
+        renderConsole();
+        const updated = entries.some((entry) => Boolean(entry.updated));
+        if (mode === 'python') {
+          setStatus(updated ? 'Python console finished and updated the tensor.' : 'Python console finished.', 'success');
+        } else if (mode === 'reset') {
+          setStatus('Tensor reset finished.', 'success');
+        } else {
+          setStatus(updated ? 'Helper finished and updated the tensor.' : 'Helper finished.', 'success');
+        }
       } else if (message.type === 'error') {
-        setStatus(message.message || 'Unknown error');
+        transformBusy = false;
+        updateControls();
+        setStatus(message.message || 'Unknown error', 'error');
       }
     });
 
@@ -643,8 +1636,166 @@ export class ViewerSession implements vscode.Disposable {
     window.addEventListener('keydown', (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'g') {
         event.preventDefault();
-        vscode.postMessage({ type: 'requestCommand', command: 'goto' });
+        focusJumpInput();
       }
+    });
+
+    jumpInput.addEventListener('input', () => {
+      if (jumpTimer) {
+        clearTimeout(jumpTimer);
+      }
+      if (!jumpInput.value.trim()) {
+        setStatus('', 'info');
+        clearHighlight();
+        return;
+      }
+      jumpTimer = setTimeout(() => {
+        applyJump(jumpInput.value, false);
+      }, 180);
+    });
+
+    jumpInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        if (jumpTimer) {
+          clearTimeout(jumpTimer);
+        }
+        applyJump(jumpInput.value, true);
+      }
+    });
+
+    jumpInput.addEventListener('blur', () => {
+      if (jumpInput.value.trim()) {
+        applyJump(jumpInput.value, true);
+      }
+    });
+
+    transformMode.addEventListener('change', () => {
+      updateControls();
+      if (transformMode.value === 'reset') {
+        helperInput.value = '';
+        transformInput.value = '';
+        setStatus('Reset restores the selected tensor.', 'info');
+      } else if (statusEl.dataset.kind === 'info') {
+        setStatus('', 'info');
+      }
+    });
+
+    helperInput.addEventListener('input', () => {
+      updateControls();
+    });
+
+    helperInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        runHelperBtn.click();
+      }
+    });
+
+    transformInput.addEventListener('input', () => {
+      updateControls();
+    });
+
+    transformInput.addEventListener('keydown', (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+        event.preventDefault();
+        consoleForm.requestSubmit();
+      }
+    });
+
+    consoleForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      if (!isTransformEnabled()) {
+        return;
+      }
+
+      if (transformMode.value !== 'python') {
+        return;
+      }
+
+      if (!consoleEditorOpen) {
+        openPythonEditor();
+        return;
+      }
+
+      const value = transformInput.value.trim();
+      if (!value) {
+        setStatus('Enter a tensor expression first.', 'error');
+        return;
+      }
+
+      startConsoleRun('python', value);
+    });
+
+    clearConsoleBtn.addEventListener('click', () => {
+      consoleEntries = [];
+      renderConsole();
+      updateControls();
+    });
+
+    toggleConsoleDockBtn.addEventListener('click', () => {
+      if (consoleDockOpen) {
+        closeConsoleDock();
+        return;
+      }
+      openConsoleDock({ focusPython: transformMode.value === 'python' && consoleEditorOpen });
+    });
+
+    closeDockBtn.addEventListener('click', () => {
+      closeConsoleDock();
+    });
+
+    toggleConsoleBtn.addEventListener('click', () => {
+      if (!isTransformEnabled()) {
+        return;
+      }
+      if (transformMode.value !== 'python' || !consoleEditorOpen) {
+        openPythonEditor();
+        return;
+      }
+      if (!consoleDockOpen) {
+        openConsoleDock({ focusPython: true, silent: true });
+      }
+      focusPythonEditor();
+    });
+
+    closeConsoleBtn.addEventListener('click', () => {
+      closePythonEditor();
+    });
+
+    runHelperBtn.addEventListener('click', () => {
+      if (!isTransformEnabled() || transformMode.value === 'python') {
+        return;
+      }
+      const mode = transformMode.value;
+      const value = helperInput.value.trim();
+      if (mode !== 'reset' && !value) {
+        setStatus(mode === 'reshape' ? 'Enter a target shape first.' : 'Enter a slice expression first.', 'error');
+        return;
+      }
+      startConsoleRun(mode, value);
+    });
+
+    insertExampleBtn.addEventListener('click', () => {
+      if (transformMode.value === 'python') {
+        if (!consoleEditorOpen) {
+          openPythonEditor();
+        } else if (!consoleDockOpen) {
+          openConsoleDock({ focusPython: true, silent: true });
+        }
+        transformInput.value = pythonExample;
+        updateControls({ focusPython: true });
+        return;
+      }
+
+      const example = helperExamples[transformMode.value] || '';
+      if (!example) {
+        return;
+      }
+      helperInput.value = example;
+      updateControls();
+      helperInput.focus();
+      helperInput.setSelectionRange(helperInput.value.length, helperInput.value.length);
     });
 
     document.querySelectorAll('[data-command]').forEach((button) => {
@@ -653,6 +1804,8 @@ export class ViewerSession implements vscode.Disposable {
       });
     });
 
+    renderConsole();
+    updateControls();
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>
@@ -694,4 +1847,21 @@ function parseShapeInput(input: string): number[] {
   }
 
   return shape;
+}
+
+function buildConsoleSource(mode: string, value: string): string {
+  if (mode === 'python') {
+    return value;
+  }
+  if (mode === 'reshape') {
+    parseShapeInput(value);
+    return `tensor = tensor.reshape(${value})`;
+  }
+  if (mode === 'slice') {
+    if (!value.trim()) {
+      throw new Error('Slice expression cannot be empty.');
+    }
+    return `tensor = tensor[${value}]`;
+  }
+  throw new Error(`Unsupported console mode: ${mode}`);
 }

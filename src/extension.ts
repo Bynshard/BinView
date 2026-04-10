@@ -24,19 +24,7 @@ class SessionManager implements vscode.Disposable {
     }
 
     try {
-      const source = await this.createSource(uri);
-      const session = await ViewerSession.create(this.context, source, undefined, (active, sourceSession) => {
-        if (active) {
-          this.activeSession = active;
-          return;
-        }
-        if (this.activeSession === sourceSession) {
-          this.activeSession = undefined;
-        }
-        this.sessions.delete(sourceSession);
-      });
-      this.sessions.add(session);
-      this.context.subscriptions.push(session);
+      await this.openSession(uri);
     } catch (error) {
       void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
     }
@@ -70,25 +58,14 @@ class SessionManager implements vscode.Disposable {
         return;
       }
 
-      const [leftSource, rightSource] = await Promise.all([
-        this.createSource(leftUri),
-        this.createSource(rightUri)
-      ]);
-      const session = await ViewerSession.create(this.context, leftSource, rightSource, (active, sourceSession) => {
-        if (active) {
-          this.activeSession = active;
-          return;
-        }
-        if (this.activeSession === sourceSession) {
-          this.activeSession = undefined;
-        }
-        this.sessions.delete(sourceSession);
-      });
-      this.sessions.add(session);
-      this.context.subscriptions.push(session);
+      await this.openSession(leftUri, rightUri);
     } catch (error) {
       void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  async openInPanel(resource: vscode.Uri, panel: vscode.WebviewPanel): Promise<void> {
+    await this.openSession(resource, undefined, panel);
   }
 
   async gotoLine(): Promise<void> {
@@ -142,6 +119,11 @@ class SessionManager implements vscode.Disposable {
       return createNpyBinarySource(filePath);
     }
 
+    if (isRawFile(fileName)) {
+      const rawOptions = await promptRawOptions(getRawOpenSettings());
+      return createRawBinarySource(filePath, rawOptions);
+    }
+
     if (isTorchFile(fileName)) {
       const python = await resolvePythonInterpreter(vscode.workspace.getWorkspaceFolder(uri)?.uri);
       if (python) {
@@ -157,8 +139,40 @@ class SessionManager implements vscode.Disposable {
       return new TorchBinarySource(filePath, vscode.workspace.getWorkspaceFolder(uri), this.context.extensionUri);
     }
 
-    const rawOptions = await promptRawOptions();
+    const rawOptions = await promptRawOptions(getRawOpenSettings());
     return createRawBinarySource(filePath, rawOptions);
+  }
+
+  private async openSession(
+    leftUri: vscode.Uri,
+    rightUri?: vscode.Uri,
+    panel?: vscode.WebviewPanel
+  ): Promise<void> {
+    const [leftSource, rightSource] = await Promise.all([
+      this.createSource(leftUri),
+      rightUri ? this.createSource(rightUri) : Promise.resolve(undefined)
+    ]);
+
+    const session = panel
+      ? await ViewerSession.createInPanel(this.context, leftSource, rightSource, panel, (active, sourceSession) => {
+          this.handleSessionFocus(active, sourceSession);
+        })
+      : await ViewerSession.create(this.context, leftSource, rightSource, (active, sourceSession) => {
+          this.handleSessionFocus(active, sourceSession);
+        });
+    this.sessions.add(session);
+    this.context.subscriptions.push(session);
+  }
+
+  private handleSessionFocus(active: ViewerSession | undefined, sourceSession: ViewerSession): void {
+    if (active) {
+      this.activeSession = active;
+      return;
+    }
+    if (this.activeSession === sourceSession) {
+      this.activeSession = undefined;
+    }
+    this.sessions.delete(sourceSession);
   }
 
   private async pickFormat(fileName: string): Promise<'raw' | 'npy' | 'torch'> {
@@ -197,11 +211,47 @@ class SessionManager implements vscode.Disposable {
   }
 }
 
+class BinViewCustomDocument implements vscode.CustomDocument {
+  constructor(readonly uri: vscode.Uri) {}
+
+  dispose(): void {}
+}
+
+class BinViewCustomEditorProvider implements vscode.CustomReadonlyEditorProvider<BinViewCustomDocument> {
+  constructor(private readonly manager: SessionManager) {}
+
+  async openCustomDocument(uri: vscode.Uri): Promise<BinViewCustomDocument> {
+    return new BinViewCustomDocument(uri);
+  }
+
+  async resolveCustomEditor(
+    document: BinViewCustomDocument,
+    webviewPanel: vscode.WebviewPanel
+  ): Promise<void> {
+    try {
+      await this.manager.openInPanel(document.uri, webviewPanel);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      webviewPanel.title = `BinView: ${path.basename(document.uri.fsPath)}`;
+      webviewPanel.webview.options = { enableScripts: true };
+      webviewPanel.webview.html = renderEditorError(document.uri, message);
+      void vscode.window.showErrorMessage(message);
+    }
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const manager = new SessionManager(context);
   context.subscriptions.push(manager);
+  const customEditorProvider = new BinViewCustomEditorProvider(manager);
 
   context.subscriptions.push(
+    vscode.window.registerCustomEditorProvider('binView.viewer', customEditorProvider, {
+      supportsMultipleEditorsPerDocument: true,
+      webviewOptions: {
+        retainContextWhenHidden: true
+      }
+    }),
     vscode.commands.registerCommand('binView.openBinary', async (resource?: vscode.Uri) => manager.openSingle(resource)),
     vscode.commands.registerCommand('binView.compareBinary', async (resource?: vscode.Uri) => manager.compare(resource)),
     vscode.commands.registerCommand('binView.gotoLine', async () => manager.gotoLine()),
@@ -216,7 +266,32 @@ export function deactivate(): void {
   // VS Code disposes subscriptions automatically.
 }
 
-async function promptRawOptions(): Promise<RawOpenOptions> {
+interface RawOpenSettings {
+  defaultDtypeId: string;
+  littleEndian: boolean;
+  promptOnOpen: boolean;
+}
+
+function getRawOpenSettings(): RawOpenSettings {
+  const config = vscode.workspace.getConfiguration('binView.raw');
+  const configuredDtype = config.get<string>('defaultDtype', 'float32');
+  const defaultDtypeId = RAW_TYPE_CHOICES.some((item) => item.id === configuredDtype) ? configuredDtype : 'float32';
+
+  return {
+    defaultDtypeId,
+    littleEndian: config.get<string>('defaultEndianness', 'little') !== 'big',
+    promptOnOpen: config.get<boolean>('promptOnOpen', true)
+  };
+}
+
+async function promptRawOptions(settings: RawOpenSettings): Promise<RawOpenOptions> {
+  if (!settings.promptOnOpen) {
+    return {
+      dtypeId: settings.defaultDtypeId,
+      littleEndian: settings.littleEndian
+    };
+  }
+
   const dtype = await vscode.window.showQuickPick(
     RAW_TYPE_CHOICES.map((item) => ({
       label: item.label,
@@ -224,7 +299,7 @@ async function promptRawOptions(): Promise<RawOpenOptions> {
       value: item.id
     })),
     {
-      placeHolder: 'Select the scalar type for this raw binary file'
+      placeHolder: `Select the scalar type for this raw binary file (default: ${settings.defaultDtypeId})`
     }
   );
 
@@ -234,8 +309,8 @@ async function promptRawOptions(): Promise<RawOpenOptions> {
 
   const littleEndian = await vscode.window.showQuickPick(
     [
-      { label: 'Little endian', value: true },
-      { label: 'Big endian', value: false }
+      { label: 'Little endian', description: settings.littleEndian ? 'Configured default' : undefined, value: true },
+      { label: 'Big endian', description: settings.littleEndian ? undefined : 'Configured default', value: false }
     ],
     {
       placeHolder: 'Select the byte order used by this raw binary file'
@@ -267,4 +342,48 @@ async function pickOneFile(placeHolder: string): Promise<vscode.Uri | undefined>
 
 function isTorchFile(fileName: string): boolean {
   return fileName.endsWith('.pt') || fileName.endsWith('.pth') || fileName.endsWith('.ckpt');
+}
+
+function isRawFile(fileName: string): boolean {
+  return fileName.endsWith('.bin');
+}
+
+function renderEditorError(uri: vscode.Uri, message: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BinView</title>
+  <style>
+    body {
+      font-family: var(--vscode-font-family);
+      background: var(--vscode-editor-background);
+      color: var(--vscode-editor-foreground);
+      padding: 24px;
+      line-height: 1.5;
+    }
+    code {
+      font-family: var(--vscode-editor-font-family, monospace);
+    }
+    .message {
+      color: var(--vscode-errorForeground);
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h2>BinView could not open this file</h2>
+  <p><code>${escapeHtml(uri.fsPath)}</code></p>
+  <p class="message">${escapeHtml(message)}</p>
+</body>
+</html>`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
 }

@@ -3,7 +3,17 @@
   "displayName": "BinView",
   "description": "Inspect raw binary, NumPy, and PyTorch tensor files inside VS Code.",
   "version": "0.0.1",
-  "publisher": "local",
+  "publisher": "bynshard",
+  "author": "bynshard",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:Bynshard/BinView.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Bynshard/BinView/issues"
+  },
+  "homepage": "https://github.com/Bynshard/BinView#readme",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -18,10 +28,35 @@
     "onCommand:binView.reshape",
     "onCommand:binView.slice",
     "onCommand:binView.resetTransform",
-    "onCommand:binView.reload"
+    "onCommand:binView.reload",
+    "onCustomEditor:binView.viewer"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "customEditors": [
+      {
+        "viewType": "binView.viewer",
+        "displayName": "BinView",
+        "selector": [
+          {
+            "filenamePattern": "*.bin"
+          },
+          {
+            "filenamePattern": "*.npy"
+          },
+          {
+            "filenamePattern": "*.pt"
+          },
+          {
+            "filenamePattern": "*.pth"
+          },
+          {
+            "filenamePattern": "*.ckpt"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
     "commands": [
       {
         "command": "binView.openBinary",
@@ -95,7 +130,46 @@
         "mac": "cmd+g",
         "when": "binView.viewerFocused"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "BinView",
+      "properties": {
+        "binView.raw.promptOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prompt for dtype and endianness when opening raw binary files. Disable this to always use the defaults below."
+        },
+        "binView.raw.defaultDtype": {
+          "type": "string",
+          "default": "float32",
+          "enum": [
+            "float32",
+            "float16",
+            "float64",
+            "bfloat16",
+            "int8",
+            "uint8",
+            "int16",
+            "uint16",
+            "int32",
+            "uint32",
+            "int64",
+            "uint64",
+            "bool"
+          ],
+          "description": "Default scalar type used for raw binary files when prompts are disabled."
+        },
+        "binView.raw.defaultEndianness": {
+          "type": "string",
+          "default": "little",
+          "enum": [
+            "little",
+            "big"
+          ],
+          "description": "Default byte order used for raw binary files when prompts are disabled."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

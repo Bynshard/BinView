@@ -1,7 +1,16 @@
 .github/**
 .git/**
+.venv/**
+.vscode/**
+dist/**
+samples/**
+scripts/**
 src/**
 tsconfig.json
 .gitignore
 *.vsix
 **/*.map
+sample_numpy_data.npy
+resources/python/__pycache__/**
+**/__pycache__/**
+**/*.pyc
